@@ -1,4 +1,7 @@
 /** Deterministic snapshot-to-board model. Node 22 standard library only. */
+import { EvidenceGrade, scoreEvidence } from './evidence.ts';
+
+/** One protocol record exactly as normalized from sealed snapshot. */
 export interface Protocol {
   slug: string;
   name: string;
@@ -12,6 +15,7 @@ export interface Protocol {
   symbol: string | null;
 }
 
+/** Complete immutable input document consumed by radar. */
 export interface Snapshot {
   as_of: string;
   source: string;
@@ -20,6 +24,7 @@ export interface Snapshot {
   watchlist: string[];
 }
 
+/** Public valuation constants; dashboard displays same values. */
 export interface Model {
   base_multiple: number;
   growth_weight: number;
@@ -42,6 +47,7 @@ export const MODEL: Model = {
   unknown_age_days: 365,
 };
 
+/** Required gate row plus transparent model inputs and plan. */
 export interface BoardRow extends Protocol {
   rank: number;
   token_status: 'pre-token';
@@ -57,7 +63,8 @@ export interface BoardRow extends Protocol {
   farm_steps: string[];
 }
 
-interface RadarRow {
+/** Compact row embedded in offline dashboard data. */
+export interface RadarRow {
   rank: number;
   slug: string;
   name: string;
@@ -72,11 +79,13 @@ interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   watchlist: boolean;
-  evidence_grade: 'A' | 'B' | 'C';
+  evidence_grade: EvidenceGrade;
+  evidence_score: number;
   farm_steps: string[];
 }
 
-interface LiveRow {
+/** Already-trading comparison record excluded from implied-value board. */
+export interface LiveRow {
   slug: string;
   name: string;
   category: string | null;
@@ -86,6 +95,7 @@ interface LiveRow {
   change_7d: number | null;
 }
 
+/** Entire serializable state required by static dashboard. */
 export interface RadarData {
   as_of: string;
   source: string;
@@ -169,6 +179,29 @@ export function isPreToken(p: Protocol): boolean {
   return p.mcap_usd === null && p.gecko_id === null && p.symbol === null;
 }
 
+/** Number of unique, non-empty chains represented by protocols. */
+export function chainDiversity(protocols: readonly Pick<Protocol, 'chains'>[]): number {
+  const chains = new Set<string>();
+  for (const protocol of protocols) {
+    for (const chain of protocol.chains) {
+      const normalized = chain.trim();
+      if (normalized.length > 0) chains.add(normalized);
+    }
+  }
+  return chains.size;
+}
+
+/** Keep rows in or out of official watchlist without changing original order. */
+export function filterByWatchlist<T extends { slug: string }>(
+  rows: readonly T[],
+  watchlist: readonly string[],
+  scope: 'all' | 'watchlist' | 'early',
+): T[] {
+  if (scope === 'all') return [...rows];
+  const official = new Set(watchlist);
+  return rows.filter((row) => scope === 'watchlist' ? official.has(row.slug) : !official.has(row.slug));
+}
+
 function isRankable(p: Protocol): boolean {
   return isPreToken(p) && p.category !== 'CEX' && !VERSIONED.test(p.name);
 }
@@ -235,12 +268,6 @@ export function farmSteps(p: Protocol, age: number | null): string[] {
   ];
 }
 
-function evidenceGrade(p: Protocol): 'A' | 'B' | 'C' {
-  if (p.listed_at !== null && p.change_7d !== null) return 'A';
-  if (p.listed_at !== null || p.change_7d !== null) return 'B';
-  return 'C';
-}
-
 export function buildBoard(snapshot: Snapshot, model: Model = MODEL): BoardRow[] {
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const selected = new Map<string, Protocol>();
@@ -279,6 +306,7 @@ function liveRows(snapshot: Snapshot): LiveRow[] {
 }
 
 function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
+  const evidence = scoreEvidence(row);
   return {
     rank: row.rank,
     slug: row.slug,
@@ -294,7 +322,8 @@ function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     watchlist: watchlist.has(row.slug),
-    evidence_grade: evidenceGrade(row),
+    evidence_grade: evidence.grade,
+    evidence_score: evidence.score,
     farm_steps: row.farm_steps,
   };
 }

@@ -10,7 +10,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/radar.ts';
+import { boardIssue, buildRadar, chainDiversity, dataScript, filterByWatchlist, parseSnapshot, type BoardRow } from './lib/radar.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
@@ -19,12 +19,64 @@ const DASHBOARD_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
 const TEXT_MAX_BYTES = 65_536;
 const SCREENSHOT_MAX_BYTES = 524_288;
 
-function option(name: string): string | undefined {
-  const separate = process.argv.indexOf(`--${name}`);
-  if (separate >= 0 && separate + 1 < process.argv.length) return process.argv[separate + 1];
+type Scope = 'all' | 'watchlist' | 'early';
+type Sort = 'rank' | 'value' | 'tvl' | 'growth' | 'name';
+
+interface CliOptions {
+  input: string;
+  output: string;
+  category: string | null;
+  scope: Scope;
+  limit: number;
+  sort: Sort;
+}
+
+function argumentValue(args: string[], index: number, name: string): { value: string; consumed: number } {
+  const current = args[index]!;
   const prefix = `--${name}=`;
-  const combined = process.argv.find((item) => item.startsWith(prefix));
-  return combined?.slice(prefix.length);
+  if (current.startsWith(prefix)) {
+    const value = current.slice(prefix.length);
+    if (value.length === 0) fail(`--${name} needs a value`);
+    return { value, consumed: 1 };
+  }
+  const value = args[index + 1];
+  if (value === undefined || value.startsWith('--')) fail(`--${name} needs a value`);
+  return { value, consumed: 2 };
+}
+
+function parseCli(args: string[], environment: NodeJS.ProcessEnv): CliOptions {
+  const values: CliOptions = {
+    input: '/input',
+    output: environment.MAKEFUN_OUTPUT_DIR ?? '/output',
+    category: null,
+    scope: 'all',
+    limit: 10,
+    sort: 'rank',
+  };
+  for (let index = 0; index < args.length;) {
+    const argument = args[index]!;
+    const name = argument.startsWith('--') ? argument.slice(2).split('=', 1)[0]! : '';
+    if (!['input', 'output', 'category', 'scope', 'limit', 'sort'].includes(name)) fail(`unknown argument: ${argument}`);
+    const parsed = argumentValue(args, index, name);
+    if (name === 'input') values.input = parsed.value;
+    if (name === 'output') values.output = parsed.value;
+    if (name === 'category') values.category = parsed.value;
+    if (name === 'scope') {
+      if (!['all', 'watchlist', 'early'].includes(parsed.value)) fail('--scope must be all, watchlist, or early');
+      values.scope = parsed.value as Scope;
+    }
+    if (name === 'limit') {
+      const limit = Number(parsed.value);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) fail('--limit must be a whole number from 1 to 100');
+      values.limit = limit;
+    }
+    if (name === 'sort') {
+      if (!['rank', 'value', 'tvl', 'growth', 'name'].includes(parsed.value)) fail('--sort must be rank, value, tvl, growth, or name');
+      values.sort = parsed.value as Sort;
+    }
+    index += parsed.consumed;
+  }
+  return values;
 }
 
 function fail(message: string): never {
@@ -32,13 +84,39 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-function inputPath(): string {
-  const selected = option('input') ?? '/input';
+function inputPath(selected: string): string {
   return selected.endsWith('.json') ? selected : join(selected, 'snapshot.json');
 }
 
-function outputPath(): string {
-  return option('output') ?? process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+function reportRows(board: BoardRow[], watchlist: string[], options: CliOptions): BoardRow[] {
+  let rows = filterByWatchlist(board, watchlist, options.scope);
+  if (options.category !== null) {
+    const category = options.category.toLocaleLowerCase('en-US');
+    rows = rows.filter((row) => (row.category ?? 'Other').toLocaleLowerCase('en-US') === category);
+  }
+  const compare: Record<Sort, (a: BoardRow, b: BoardRow) => number> = {
+    rank: (a, b) => a.rank - b.rank,
+    value: (a, b) => b.implied_value_usd - a.implied_value_usd || a.rank - b.rank,
+    tvl: (a, b) => b.tvl_usd - a.tvl_usd || a.rank - b.rank,
+    growth: (a, b) => (b.change_7d ?? -Infinity) - (a.change_7d ?? -Infinity) || a.rank - b.rank,
+    name: (a, b) => a.name.localeCompare(b.name) || a.rank - b.rank,
+  };
+  return rows.sort(compare[options.sort]).slice(0, options.limit);
+}
+
+function summaryReport(board: BoardRow[], watchlist: string[], options: CliOptions): string {
+  const rows = reportRows(board, watchlist, options);
+  const category = options.category ?? 'all';
+  const lines = [
+    `token radar report: scope=${options.scope} category=${category} sort=${options.sort} limit=${options.limit}`,
+    `token radar report: ${rows.length} shown; ${chainDiversity(rows)} unique chains represented`,
+  ];
+  rows.forEach((row, index) => {
+    const growth = row.change_7d === null ? 'n/a' : `${row.change_7d.toFixed(2)}%`;
+    lines.push(`  ${index + 1}. #${row.rank} ${row.name} | implied=$${row.implied_value_usd} | tvl=$${row.tvl_usd} | 7d=${growth}`);
+  });
+  if (rows.length === 0) lines.push('  No rows match report filters; complete board remains written unchanged.');
+  return `${lines.join('\n')}\n`;
 }
 
 function copyDirectory(from: string, to: string, namePattern: RegExp): string[] {
@@ -66,13 +144,14 @@ function validateScreenshots(directory: string, names: string[]): void {
   }
 }
 
-const input = inputPath();
+const cli = parseCli(process.argv.slice(2), process.env);
+const input = inputPath(cli.input);
 if (!existsSync(input)) {
   process.stderr.write(`token radar: no snapshot at ${input}: pass --input <snapshot.json|directory> or mount /input\n`);
   process.exit(2);
 }
 
-const output = outputPath();
+const output = cli.output;
 const snapshot = parseSnapshot(readFileSync(input, 'utf8'));
 const { board, radar } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
@@ -100,5 +179,6 @@ writeFileSync(join(output, 'dossier.json'), dossier);
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols; ${snapshot.watchlist.length}/${snapshot.watchlist.length} watchlist covered; ${board.length} pre-token rows (${radar.early_size} early)\n` +
-  `token radar: wrote board, offline dashboard (${dashboardFiles.length} files), ${screenshots.length} screenshots, and byte-exact dossier to ${output}\n`,
+  `token radar: wrote board, offline dashboard (${dashboardFiles.length} files), ${screenshots.length} screenshots, and byte-exact dossier to ${output}\n` +
+  summaryReport(board, snapshot.watchlist, cli),
 );
